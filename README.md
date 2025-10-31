@@ -1,4 +1,4 @@
-# SignSTGCN
+# Signer-Conditioned Attention ST-GCN with multi-head bias-aware gating
 
 A PyTorch implementation for sign language detection and recognition using Spatio-Temporal Graph Convolutional Networks (ST-GCN). This model incorporates signer-aware attention, adversarial training to reduce signer bias, and supports both multi-class sign classification and binary signing detection.
 
@@ -269,6 +269,10 @@ If you use this code in your research, please cite:
   year={2024}
 }
 ```
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
 ## Acknowledgments
 
