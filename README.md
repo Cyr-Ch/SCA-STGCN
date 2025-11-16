@@ -204,6 +204,35 @@ python -m build_video_splits \
     --out splits.json
 ```
 
+### Testing All Variations
+
+Train all model variations on a small subset of data for quick testing:
+
+```bash
+python train_all_variations.py \
+    --data /path/to/landmarks/folder \
+    --max-files 3 \
+    --epochs 2 \
+    --batch 8 \
+    --base-out runs/test_variations
+```
+
+This script will train:
+- Basic training
+- Binary classification
+- Pseudo-signer clustering
+- Supervised contrastive learning
+- FiLM attention
+- MI minimization
+- Combined variations
+
+Options:
+- `--max-files`: Limit number of .npz files to use (default: 3)
+- `--epochs`: Number of epochs per variation (default: 2)
+- `--batch`: Batch size (default: 8)
+- `--base-out`: Base output directory (default: runs/test_variations)
+- `--skip-*`: Skip specific variations (e.g., `--skip-binary`, `--skip-pseudo`)
+
 ## Model Configuration
 
 The model can be customized through various hyperparameters:
@@ -240,11 +269,13 @@ Checkpoint format:
 ```
 SignSTGCN/
 ├── train_landmarks.py          # Main training script
+├── train_all_variations.py     # Train all variations on small data subset
 ├── signGCN.py                  # Model entry point / example usage
 ├── model.py                    # SignSTGCNModel implementation
 ├── losses.py                   # Loss functions
 ├── build_video_splits.py       # Video split generation
 ├── visualize_signer_embeddings.py  # Embedding visualization
+├── test_film_attention.py       # Test script for FiLM attention
 ├── datasets/
 │   └── landmarks_npz.py        # NPZ landmark dataset
 ├── layers/

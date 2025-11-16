@@ -3,8 +3,14 @@ from typing import Tuple, Dict
 import torch
 import torch.nn as nn
 
-from .layers import STGCNBackbone
-from .modules import SignerEncoder, BiasAwareAttention, TemporalAggregator, ClassifierHead, SignerHead
+# Support both relative and absolute imports
+try:
+    from .layers import STGCNBackbone
+    from .modules import SignerEncoder, BiasAwareAttention, FiLMSignerAttention, TemporalAggregator, ClassifierHead, SignerHead
+except ImportError:
+    # Fallback to absolute imports
+    from layers import STGCNBackbone
+    from modules import SignerEncoder, BiasAwareAttention, FiLMSignerAttention, TemporalAggregator, ClassifierHead, SignerHead
 
 
 class SignSTGCNModel(nn.Module):
@@ -31,7 +37,8 @@ class SignSTGCNModel(nn.Module):
         lambda_grl: float = 0.5,
         attn_heads: int = 4,
         attn_dropout: float = 0.0,
-        dropout: float = 0.1
+        dropout: float = 0.1,
+        use_film_attention: bool = False
     ):
         super().__init__()
         self.J = num_joints
@@ -52,7 +59,11 @@ class SignSTGCNModel(nn.Module):
 
         # signer encoder + bias-aware attention
         self.signer_enc = SignerEncoder(signer_stats_dim, signer_emb_dim)
-        self.attn = BiasAwareAttention(feat_dim=feat_dim, signer_dim=signer_emb_dim, num_heads=attn_heads, attn_dropout=attn_dropout)
+        # Use FiLM-style multiplicative attention if requested, otherwise use additive concatenation
+        if use_film_attention:
+            self.attn = FiLMSignerAttention(feat_dim=feat_dim, signer_dim=signer_emb_dim, num_heads=attn_heads, attn_dropout=attn_dropout)
+        else:
+            self.attn = BiasAwareAttention(feat_dim=feat_dim, signer_dim=signer_emb_dim, num_heads=attn_heads, attn_dropout=attn_dropout)
 
         # temporal aggregator
         self.temporal = TemporalAggregator(in_dim=feat_dim, hidden=temporal_hidden, num_layers=1, bidirectional=True, dropout=dropout)

@@ -31,7 +31,11 @@ if __name__ == "__main__":
 
     A = build_hand_body_adjacency(J, hand_edges, body_edges).to(device)
 
-    model = SignSTGCNModel(
+    # Test both attention types
+    print("Testing FiLM Attention vs Additive Attention...")
+    
+    # Example with FiLM-style multiplicative attention (recommended for ICML)
+    model_film = SignSTGCNModel(
         num_joints=J,
         in_coords=C_in,
         stgcn_channels=(64,128,128),
@@ -45,13 +49,42 @@ if __name__ == "__main__":
         num_signers=30,
         lambda_grl=0.5,
         attn_heads=4,
-        dropout=0.1
+        dropout=0.1,
+        use_film_attention=True  # Use FiLM-style multiplicative attention
     ).to(device)
-
-    X = torch.randn(B, T, J, C_in, device=device)
-    pose_stats = torch.randn(B, 16, device=device)
-    targets = torch.randint(0, NUM_CLASSES, (B,), device=device)
-    signer_ids = torch.randint(0, 30, (B,), device=device)
+    
+    # Example with additive attention (baseline)
+    model_add = SignSTGCNModel(
+        num_joints=J,
+        in_coords=C_in,
+        stgcn_channels=(64,128,128),
+        stgcn_kernel=3,
+        stgcn_dilations=(1,2,3),
+        temporal_hidden=256,
+        num_classes=NUM_CLASSES,
+        signer_stats_dim=16,
+        signer_emb_dim=64,
+        use_signer_head=True,
+        num_signers=30,
+        lambda_grl=0.5,
+        attn_heads=4,
+        dropout=0.1,
+        use_film_attention=False  # Use additive concatenation
+    ).to(device)
+    
+    # Test forward pass
+    model_film.eval()
+    model_add.eval()
+    with torch.no_grad():
+        out_film = model_film(X, A, pose_stats, return_features=True)
+        out_add = model_add(X, A, pose_stats, return_features=True)
+    
+    print(f"✓ FiLM model forward pass: logits shape {out_film['logits'].shape}")
+    print(f"✓ Additive model forward pass: logits shape {out_add['logits'].shape}")
+    print(f"✓ Outputs differ: {torch.abs(out_film['logits'] - out_add['logits']).mean().item():.6f}")
+    
+    # Use FiLM model for rest of test
+    model = model_film
 
     out = model(X, A, pose_stats, return_features=True)
     logits = out["logits"]

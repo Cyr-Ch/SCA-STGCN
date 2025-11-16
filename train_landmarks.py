@@ -1,5 +1,6 @@
 from __future__ import annotations
 import os
+import sys
 import csv
 import argparse
 import math
@@ -13,10 +14,21 @@ except Exception:
     average_precision_score = None
     f1_score = None
 
-from .model import SignSTGCNModel
-from .datasets import NpzLandmarksDataset
-from .utils import build_hand_body_adjacency
-from .losses import classification_loss, signer_adversarial_loss, info_nce
+# Absolute imports - ensure current directory is in path
+import sys
+import os
+
+# Add current directory to Python path if not already there
+# This enables absolute imports like: from model import SignSTGCNModel
+script_dir = os.path.dirname(os.path.abspath(__file__))
+if script_dir not in sys.path:
+    sys.path.insert(0, script_dir)
+
+# Now use absolute imports
+from model import SignSTGCNModel
+from datasets import NpzLandmarksDataset
+from utils import build_hand_body_adjacency
+from losses import classification_loss, signer_adversarial_loss, info_nce, CLUBEstimator, mutual_information_loss, mutual_information_loss_onehot
 
 
 def collate_pad(batch):
@@ -54,9 +66,11 @@ def main():
     ap.add_argument('--debug', action='store_true', help='Verbose debug prints')
     ap.add_argument('--print-every', type=int, default=50, help='Batch interval for progress prints (debug)')
     ap.add_argument('--first-only', action='store_true', help='Use only the first .npz file to quickly test pipeline')
+    ap.add_argument('--max-files', type=int, default=None, help='Maximum number of .npz files to use (limits dataset size)')
+    ap.add_argument('--max-samples', type=int, default=None, help='Maximum number of samples (windows) to use from the dataset')
     ap.add_argument('--id-list', type=str, default=None, help='Path to txt with video IDs to include (one per line)')
     ap.add_argument('--splits-json', type=str, default=None, help='Path to JSON with video-based splits (keys: splits.train/val/test.videos)')
-    ap.add_argument('--stats-max-batches', type=int, default=0, help='Limit class-stats pre-scan to this many batches (0=all)')
+    ap.add_argument('--stats-max-batches', type=int, default=1, help='Limit class-stats pre-scan to this many batches (0=all)')
     # Pseudo-signer clustering options
     ap.add_argument('--use-pseudo-signers', action='store_true', help='Cluster pose_stats to define pseudo signer IDs')
     ap.add_argument('--num-pseudo-signers', type=int, default=8, help='Number of pseudo signer clusters (K)')
@@ -69,6 +83,14 @@ def main():
     # Batch-interval checkpointing
     ap.add_argument('--save-interval-batches', type=int, default=0, help='If >0, evaluate running metric and save best checkpoint every N batches')
     ap.add_argument('--batch-save-metric', type=str, default='acc', choices=['acc','loss','f1'], help='Metric to track for batch-interval best checkpoint')
+    # FiLM attention option
+    ap.add_argument('--use-film-attention', action='store_true', help='Use FiLM-style multiplicative attention instead of additive concatenation')
+    # Mutual Information minimization
+    ap.add_argument('--use-mi-minimization', action='store_true', help='Use MI minimization (CLUB) for signer-invariance instead of adversarial training')
+    ap.add_argument('--mi-weight', type=float, default=0.1, help='Weight for MI minimization loss')
+    ap.add_argument('--mi-hidden-dim', type=int, default=128, help='Hidden dimension for MI estimator network')
+    # Label mapping options
+    ap.add_argument('--map-unknown-to-n', action='store_true', help='Map unknown labels (?) to not-signing (n)')
     args = ap.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -76,6 +98,32 @@ def main():
         print('Args:', vars(args))
         print('Device:', device)
 
+    # Resolve data path to absolute path to avoid issues with relative paths
+    # If path is relative, try resolving relative to current working directory first,
+    # then try relative to script directory if that doesn't exist
+    original_data = args.data
+    if not os.path.isabs(args.data):
+        # First try: resolve relative to current working directory
+        resolved_path = os.path.abspath(os.path.expanduser(args.data))
+        if os.path.exists(resolved_path):
+            args.data = resolved_path
+        else:
+            # Second try: resolve relative to script directory (SignSTGCN)
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            alt_path = os.path.abspath(os.path.join(script_dir, args.data))
+            if os.path.exists(alt_path):
+                args.data = alt_path
+            else:
+                # Use the first resolved path anyway (will show error later)
+                args.data = resolved_path
+    else:
+        args.data = os.path.expanduser(args.data)
+    
+    if args.debug:
+        print('Original data path:', original_data)
+        print('Resolved data path:', args.data)
+        print('Data path exists:', os.path.exists(args.data))
+    
     gt_path = os.path.join(args.data, 'groundtruth.txt') if os.path.exists(os.path.join(args.data, 'groundtruth.txt')) else os.path.join(args.data, 'groundtruth')
     # Option A: use splits JSON if provided
     if args.splits_json and os.path.exists(args.splits_json):
@@ -95,8 +143,9 @@ def main():
             include_pose=bool(args.include_pose),
             include_hands=bool(args.include_hands),
             include_face=bool(args.include_face),
-            max_files=(1 if args.first_only else None),
+            max_files=(1 if args.first_only else args.max_files),
             allowed_ids=train_ids,
+            map_unknown_to_n=args.map_unknown_to_n,
         )
         val_ds = NpzLandmarksDataset(
             root=args.data,
@@ -109,7 +158,35 @@ def main():
             include_face=bool(args.include_face),
             max_files=None,
             allowed_ids=val_ids,
+            map_unknown_to_n=args.map_unknown_to_n,
         )
+        
+        if args.debug:
+            print('Train dataset size:', len(train_ds))
+            print('Val dataset size:', len(val_ds))
+            if len(train_ds) == 0 or len(val_ds) == 0:
+                print('[WARNING] One or both datasets are empty!')
+        
+        if len(train_ds) == 0:
+            print('[ERROR] Train dataset is empty. Cannot train.')
+            sys.exit(1)
+        if len(val_ds) == 0:
+            print('[ERROR] Val dataset is empty. Cannot train.')
+            sys.exit(1)
+        
+        # Limit datasets to max_samples if specified
+        if args.max_samples is not None and args.max_samples > 0:
+            from torch.utils.data import Subset
+            train_max = min(args.max_samples, len(train_ds))
+            val_max = min(max(1, int(0.1 * train_max)), len(val_ds))  # Keep 10% for val
+            if args.debug:
+                print(f'Limiting train dataset to {train_max} samples (from {len(train_ds)})')
+                print(f'Limiting val dataset to {val_max} samples (from {len(val_ds)})')
+            train_ds = Subset(train_ds, list(range(train_max)))
+            val_ds = Subset(val_ds, list(range(val_max)))
+            if args.debug:
+                print(f'Train dataset size after limiting: {len(train_ds)}')
+                print(f'Val dataset size after limiting: {len(val_ds)}')
     else:
         # Option B: use single id-list or default list, then random split
         allowed_ids = None
@@ -130,11 +207,38 @@ def main():
             include_pose=bool(args.include_pose),
             include_hands=bool(args.include_hands),
             include_face=bool(args.include_face),
-            max_files=(1 if args.first_only else None),
+            max_files=(1 if args.first_only else args.max_files),
             allowed_ids=allowed_ids,
+            map_unknown_to_n=args.map_unknown_to_n,
         )
         if args.debug:
             print('Total windows in dataset:', len(ds))
+            if len(ds) == 0:
+                print('[WARNING] Dataset is empty! Possible reasons:')
+                print('  - .npz files are shorter than window size (', args.window, ')')
+                print('  - .npz files don\'t have expected keys (pose, left_hand, right_hand, face)')
+                print('  - Files filtered by allowed_ids don\'t exist')
+                print('  - Files are empty or corrupted')
+        
+        if len(ds) == 0:
+            print('[ERROR] Dataset is empty. Cannot train. Please check:')
+            print('  1. .npz files exist in:', args.data)
+            print('  2. Files have at least', args.window, 'frames')
+            print('  3. Files contain expected keys (pose, left_hand, right_hand, or face)')
+            if allowed_ids:
+                print('  4. Video IDs in id-list match .npz filenames (without extension)')
+            sys.exit(1)
+        
+        # Limit dataset to max_samples if specified
+        if args.max_samples is not None and args.max_samples > 0:
+            max_samples = min(args.max_samples, len(ds))
+            if args.debug:
+                print(f'Limiting dataset to {max_samples} samples (from {len(ds)})')
+            from torch.utils.data import Subset
+            indices = list(range(max_samples))
+            ds = Subset(ds, indices)
+            if args.debug:
+                print(f'Dataset size after limiting: {len(ds)}')
 
         # split train/val
         val_size = max(1, int(0.1 * len(ds)))
@@ -179,13 +283,42 @@ def main():
         num_signers=num_signers,
         signer_stats_dim=sample_stats.numel(),
         use_signer_head=use_signer_head,
+        use_film_attention=args.use_film_attention,
     ).to(device)
     if args.debug:
         total_params = sum(p.numel() for p in model.parameters())
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         print('Model params -> total:', total_params, 'trainable:', trainable_params)
 
-    opt = torch.optim.Adam(model.parameters(), lr=args.lr)
+    # Create MI estimator if using MI minimization
+    mi_estimator = None
+    if args.use_mi_minimization:
+        # Get embedding dimension from model
+        with torch.no_grad():
+            dummy_X = torch.randn(1, 25, J, C, device=device)
+            dummy_stats = torch.randn(1, sample_stats.numel(), device=device)
+            dummy_out = model(dummy_X, A, dummy_stats, return_features=True)
+            embedding_dim = dummy_out['embedding'].shape[-1]
+            signer_emb_dim = dummy_out['signer_emb'].shape[-1]
+        
+        # Create MI estimator (can use signer embeddings or one-hot signer IDs)
+        if args.use_pseudo_signers:
+            # Use one-hot signer IDs
+            mi_estimator = CLUBEstimator(x_dim=embedding_dim, y_dim=num_signers, hidden_dim=args.mi_hidden_dim).to(device)
+        else:
+            # Use signer embeddings
+            mi_estimator = CLUBEstimator(x_dim=embedding_dim, y_dim=signer_emb_dim, hidden_dim=args.mi_hidden_dim).to(device)
+        
+        if args.debug:
+            mi_params = sum(p.numel() for p in mi_estimator.parameters())
+            print('MI estimator params:', mi_params)
+            print('MI estimator config -> x_dim:', embedding_dim, 'y_dim:', (num_signers if args.use_pseudo_signers else signer_emb_dim))
+
+    # Create optimizer (include MI estimator if using MI minimization)
+    if args.use_mi_minimization and mi_estimator is not None:
+        opt = torch.optim.Adam(list(model.parameters()) + list(mi_estimator.parameters()), lr=args.lr)
+    else:
+        opt = torch.optim.Adam(model.parameters(), lr=args.lr)
 
     # Prepare output dir and CSV
     out_dir = os.path.abspath(args.out)
@@ -294,13 +427,42 @@ def main():
                 labels = [m.get('label', '') for m in meta]
                 y = torch.tensor([1 if str(lbl).lower() in sign_set else 0 for lbl in labels], device=y.device, dtype=torch.long)
             opt.zero_grad()
-            out = model(X, A, stats, return_features=bool(args.use_supcon))
+            # Need features for MI minimization
+            need_features = bool(args.use_supcon) or bool(args.use_mi_minimization)
+            out = model(X, A, stats, return_features=need_features)
             if args.binary and class_weight_cpu is not None:
                 loss = F.cross_entropy(out['logits'], y, weight=class_weight_cpu.to(y.device))
             else:
                 loss = classification_loss(out['logits'], y)
-            # adversarial signer loss using pseudo clusters
-            if args.use_pseudo_signers and 'signer_logits' in out:
+            
+            # MI minimization loss (more principled than adversarial training)
+            if args.use_mi_minimization and mi_estimator is not None and 'embedding' in out:
+                z = out['embedding']  # (B, D)
+                if args.use_pseudo_signers:
+                    # Use one-hot signer IDs
+                    signer_ids = []
+                    if pseudo_cluster_map is not None:
+                        for m in meta:
+                            key = sample_key(m)
+                            if key in pseudo_cluster_map:
+                                signer_ids.append(pseudo_cluster_map[key])
+                            else:
+                                signer_ids.append(0)
+                    else:
+                        signer_ids = [0 for _ in range(len(meta))]
+                    signer_ids = torch.tensor(signer_ids, device=y.device, dtype=torch.long)
+                    mi_loss = mutual_information_loss_onehot(z, signer_ids, num_signers, mi_estimator)
+                else:
+                    # Use signer embeddings
+                    if 'signer_emb' in out:
+                        s = out['signer_emb']  # (B, d)
+                        mi_loss = mutual_information_loss(z, s, mi_estimator)
+                    else:
+                        mi_loss = torch.tensor(0.0, device=z.device)
+                loss = loss + float(args.mi_weight) * mi_loss
+            
+            # adversarial signer loss using pseudo clusters (only if not using MI minimization)
+            if args.use_pseudo_signers and 'signer_logits' in out and not args.use_mi_minimization:
                 # build signer ids for this batch
                 signer_ids = []
                 if pseudo_cluster_map is not None:
@@ -374,12 +536,31 @@ def main():
                     sign_set = set([s.strip().lower() for s in args.signing_labels.split(',') if s.strip()])
                     labels = [m.get('label', '') for m in meta]
                     y = torch.tensor([1 if str(lbl).lower() in sign_set else 0 for lbl in labels], device=y.device, dtype=torch.long)
-                out = model(X, A, stats, return_features=bool(args.use_supcon))
+                need_features = bool(args.use_supcon) or bool(args.use_mi_minimization)
+                out = model(X, A, stats, return_features=need_features)
                 if args.binary and class_weight_cpu is not None:
                     loss = F.cross_entropy(out['logits'], y, weight=class_weight_cpu.to(y.device))
                 else:
                     loss = classification_loss(out['logits'], y)
-                if args.use_pseudo_signers and 'signer_logits' in out and pseudo_centroids is not None:
+                
+                # MI minimization loss in validation (for monitoring)
+                if args.use_mi_minimization and mi_estimator is not None and 'embedding' in out:
+                    z = out['embedding']
+                    if args.use_pseudo_signers:
+                        s_np = stats.cpu().numpy()
+                        dists = ((s_np[:, None, :] - pseudo_centroids[None, :, :]) ** 2).sum(axis=2) ** 0.5
+                        signer_ids = np.argmin(dists, axis=1).astype(int)
+                        signer_ids = torch.from_numpy(signer_ids).to(y.device)
+                        mi_loss = mutual_information_loss_onehot(z, signer_ids, num_signers, mi_estimator)
+                    else:
+                        if 'signer_emb' in out:
+                            s = out['signer_emb']
+                            mi_loss = mutual_information_loss(z, s, mi_estimator)
+                        else:
+                            mi_loss = torch.tensor(0.0, device=z.device)
+                    loss = loss + float(args.mi_weight) * mi_loss
+                
+                if args.use_pseudo_signers and 'signer_logits' in out and pseudo_centroids is not None and not args.use_mi_minimization:
                     # assign val signer ids by nearest centroid
                     s_np = stats.cpu().numpy()  # (B,S)
                     # compute nearest centroid per row
