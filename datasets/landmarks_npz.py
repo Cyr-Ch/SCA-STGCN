@@ -1,7 +1,9 @@
+
 from __future__ import annotations
 from typing import List, Tuple, Dict, Optional, Set
 import os
 import glob
+import pickle
 import numpy as np
 import torch
 from torch.utils.data import Dataset
@@ -144,6 +146,7 @@ class NpzLandmarksDataset(Dataset):
         preprocessed_file: Optional[str] = None,
         preprocessed_dir: Optional[str] = None,
         split: Optional[str] = None,  # 'train', 'val', or 'test'
+        segment_list_file: Optional[str] = None,
     ):
         self.root = root
         self.window = window
@@ -159,18 +162,23 @@ class NpzLandmarksDataset(Dataset):
         self.preprocessed_file = preprocessed_file
         self.preprocessed_dir = preprocessed_dir
         self.split = split
-        self.is_gcs = preprocessed_dir and preprocessed_dir.startswith('gs://')
+        self.segment_list_file = segment_list_file
+        self.is_gcs = bool(
+            (preprocessed_dir and preprocessed_dir.startswith('gs://'))
+            or (segment_list_file and segment_list_file.startswith('gs://'))
+        )
+        self._fs = None  # Lazily initialized GCSFileSystem (not fork-safe to share)
+        self.mode = 'raw'  # 'per_segment', 'per_video', or 'raw'
         
         # Load from preprocessed directory (per-video NPZ files) - LAZY LOADING
         if preprocessed_dir:
             if split is None:
                 raise ValueError("split must be specified when using preprocessed_dir (e.g., 'train', 'val', 'test')")
             
-            # Handle GCS paths
+            # Handle per-segment directory (if present)
             if self.is_gcs:
                 try:
-                    import gcsfs
-                    self.fs = gcsfs.GCSFileSystem()
+                    import gcsfs  # noqa: F401  # Ensure dependency is available
                 except ImportError:
                     raise ImportError("gcsfs is required for GCS paths. Install with: pip install gcsfs")
                 
@@ -179,7 +187,8 @@ class NpzLandmarksDataset(Dataset):
                 split_dir = f"{preprocessed_dir.rstrip('/')}/{split}"
                 
                 # Check if split directory exists
-                if not self.fs.exists(split_dir):
+                fs = self._ensure_fs()
+                if not fs.exists(split_dir):
                     raise FileNotFoundError(f"Split directory not found in GCS: {split_dir}")
                 
                 print(f"Setting up lazy loading from GCS: {split_dir}...")
@@ -188,7 +197,7 @@ class NpzLandmarksDataset(Dataset):
                 # List all NPZ files in GCS directory
                 try:
                     # fs.ls() returns list of paths
-                    all_files = self.fs.ls(split_dir, detail=False)
+                    all_files = fs.ls(split_dir, detail=False)
                     # Filter for .npz files and ensure they're full GCS paths
                     video_files = []
                     for f in all_files:
@@ -204,7 +213,7 @@ class NpzLandmarksDataset(Dataset):
                     print(f"[WARNING] Error listing GCS files: {e}")
                     # Try alternative: list with detail=True to get full paths
                     try:
-                        all_files = self.fs.ls(split_dir, detail=True)
+                        all_files = fs.ls(split_dir, detail=True)
                         video_files = []
                         for item in all_files:
                             if isinstance(item, dict):
@@ -233,6 +242,25 @@ class NpzLandmarksDataset(Dataset):
                 
                 # Get all video NPZ files from the split directory
                 video_files = sorted(glob.glob(os.path.join(split_dir, '*.npz')))
+            
+            # Check if per-segment structure exists
+            segments_dir = f"{split_dir}/segments" if self.is_gcs else os.path.join(split_dir, 'segments')
+            has_segments = False
+            if self.is_gcs:
+                fs = self._ensure_fs()
+                has_segments = fs.exists(segments_dir)
+            else:
+                has_segments = os.path.exists(segments_dir)
+            
+            if has_segments:
+                self._init_per_segment_mode(
+                    segments_dir,
+                    label_map,
+                    map_unknown_to_n,
+                    num_classes,
+                    segment_list_file=segment_list_file,
+                )
+                return
             
             if len(video_files) == 0:
                 raise ValueError(f"No NPZ files found in {split_dir}")
@@ -277,10 +305,11 @@ class NpzLandmarksDataset(Dataset):
                         pass  # Try GCS cache next
                 
                 # If local cache not found, try GCS cache
-                if not cache_loaded and index_cache_file_gcs and self.fs.exists(index_cache_file_gcs):
+                fs = self._ensure_fs()
+                if not cache_loaded and index_cache_file_gcs and fs.exists(index_cache_file_gcs):
                     try:
                         import json
-                        with self.fs.open(index_cache_file_gcs, 'r') as f:
+                        with fs.open(index_cache_file_gcs, 'r') as f:
                             cache_data = json.load(f)
                         cache_loaded = True
                     except Exception as e:
@@ -342,10 +371,11 @@ class NpzLandmarksDataset(Dataset):
                             pass  # Try GCS next
                     
                     # Try GCS cache if local not found
-                    if not segment_counts_cache and self.fs.exists(segment_counts_cache_file_gcs):
+                    fs = self._ensure_fs()
+                    if not segment_counts_cache and fs.exists(segment_counts_cache_file_gcs):
                         try:
                             import json
-                            with self.fs.open(segment_counts_cache_file_gcs, 'r') as f:
+                            with fs.open(segment_counts_cache_file_gcs, 'r') as f:
                                 segment_counts_cache = json.load(f)
                             print(f"  Loaded segment counts cache from GCS")
                         except Exception as e:
@@ -372,7 +402,8 @@ class NpzLandmarksDataset(Dataset):
                         num_segments = segment_counts_cache[video_name]
                     else:
                         # Need to open file to get segment count
-                        with load_npz(video_file, fs=self.fs if self.is_gcs else None) as npz:
+                        fs = self._ensure_fs()
+                        with load_npz(video_file, fs=fs if self.is_gcs else None) as npz:
                             num_segments = len(npz['X'])
                             # Cache it for next time
                             segment_counts_cache[video_name] = num_segments
@@ -381,7 +412,8 @@ class NpzLandmarksDataset(Dataset):
                     
                     # Load config from first file only
                     if not config_loaded:
-                        with load_npz(video_file, fs=self.fs if self.is_gcs else None) as npz:
+                        fs = self._ensure_fs()
+                        with load_npz(video_file, fs=fs if self.is_gcs else None) as npz:
                             if 'config' in npz:
                                 config_bytes = npz['config']
                                 if isinstance(config_bytes, np.ndarray):
@@ -431,7 +463,8 @@ class NpzLandmarksDataset(Dataset):
                             # Try to save to GCS first, but fall back to local if write permission denied
                             try:
                                 if segment_counts_cache_file_gcs:
-                                    with self.fs.open(segment_counts_cache_file_gcs, 'w') as f:
+                                    fs = self._ensure_fs()
+                                    with fs.open(segment_counts_cache_file_gcs, 'w') as f:
                                         json.dump(segment_counts_cache, f, indent=2)
                             except Exception as e:
                                 # GCS write failed (permission denied), save locally instead
@@ -458,7 +491,8 @@ class NpzLandmarksDataset(Dataset):
                         # Try to save to GCS first, but fall back to local if write permission denied
                         try:
                             if index_cache_file_gcs:
-                                with self.fs.open(index_cache_file_gcs, 'w') as f:
+                                fs = self._ensure_fs()
+                                with fs.open(index_cache_file_gcs, 'w') as f:
                                     json.dump(cache_data, f, indent=2)
                                 print(f"  ✓ Saved index cache to GCS: {index_cache_file_gcs}")
                         except Exception as e:
@@ -479,7 +513,8 @@ class NpzLandmarksDataset(Dataset):
             # If we loaded from cache, still need to load config from first file
             if index_cache_valid and not config_loaded:
                 first_file = video_files[0]
-                with load_npz(first_file, fs=self.fs if self.is_gcs else None) as npz:
+                fs = self._ensure_fs()
+                with load_npz(first_file, fs=fs if self.is_gcs else None) as npz:
                     if 'config' in npz:
                         config_bytes = npz['config']
                         if isinstance(config_bytes, np.ndarray):
@@ -673,7 +708,108 @@ class NpzLandmarksDataset(Dataset):
         if len(self.files) > 0:
             print(f"  Created {len(self.index)} windows from {len(self.files)} files")
 
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state['_fs'] = None  # Drop cached filesystem before pickling/forking
+        return state
+
+    def _ensure_fs(self):
+        if not getattr(self, 'is_gcs', False):
+            return None
+        if getattr(self, '_fs', None) is None:
+            try:
+                import gcsfs
+            except ImportError:
+                raise ImportError("gcsfs is required for GCS paths. Install with: pip install gcsfs")
+            self._fs = gcsfs.GCSFileSystem()
+        return self._fs
+
+    def _list_segment_files(self, directory: str) -> list[str]:
+        files: list[str] = []
+        if self.is_gcs:
+            fs = self._ensure_fs()
+            for dirpath, _, filenames in fs.walk(directory.rstrip('/')):
+                base = dirpath if dirpath.startswith('gs://') else f"gs://{dirpath}"
+                for fname in filenames:
+                    if fname.endswith('.npz'):
+                        files.append(f"{base.rstrip('/')}/{fname}")
+        else:
+            for dirpath, _, filenames in os.walk(directory):
+                for fname in filenames:
+                    if fname.endswith('.npz'):
+                        files.append(os.path.join(dirpath, fname))
+        files.sort()
+        return files
+
+    def _resolve_segment_path(self, path: str, segments_dir: str) -> str:
+        path = path.strip()
+        if not path:
+            return ""
+        if path.startswith("gs://") or os.path.isabs(path):
+            return path
+        if self.is_gcs:
+            return f"{segments_dir.rstrip('/')}/{path.lstrip('/')}"
+        return os.path.normpath(os.path.join(segments_dir, path))
+
+    def _load_segment_list(self, list_path: str, segments_dir: str) -> list[str]:
+        lines: list[str] = []
+        if list_path.startswith("gs://"):
+            fs = self._ensure_fs()
+            if fs is None:
+                import gcsfs  # type: ignore
+
+                fs = gcsfs.GCSFileSystem()
+            with fs.open(list_path, "r") as f:
+                lines = [line.strip() for line in f if line.strip()]
+        else:
+            with open(list_path, "r", encoding="utf-8") as f:
+                lines = [line.strip() for line in f if line.strip()]
+        resolved = [self._resolve_segment_path(line, segments_dir) for line in lines]
+        return [p for p in resolved if p]
+
+    def _load_config_from_segment(self, segment_file: str):
+        fs = self._ensure_fs()
+        with load_npz(segment_file, fs=fs if self.is_gcs else None) as npz:
+            config_bytes = npz['config']
+            if isinstance(config_bytes, np.ndarray):
+                config_bytes = config_bytes.tobytes()
+            return pickle.loads(config_bytes)
+
+    def _init_per_segment_mode(
+        self,
+        segments_dir: str,
+        label_map: Optional[Dict[str, int]],
+        map_unknown_to_n: bool,
+        num_classes: Optional[int],
+        segment_list_file: Optional[str] = None,
+    ):
+        print(f"Setting up per-segment loading from {segments_dir}...")
+        if segment_list_file:
+            print(f"  Using segment list: {segment_list_file}")
+            self.segment_files = self._load_segment_list(segment_list_file, segments_dir)
+        else:
+            self.segment_files = self._list_segment_files(segments_dir)
+        if len(self.segment_files) == 0:
+            raise ValueError(f"No per-segment NPZ files found in {segments_dir}")
+        cfg = self._load_config_from_segment(self.segment_files[0])
+        print(f"Per-segment config: window={cfg.get('window')}, stride={cfg.get('stride')}, "
+              f"coords={cfg.get('coords')}, num_classes={cfg.get('num_classes')}")
+        if 'label_map' in cfg:
+            self.label_map = cfg['label_map']
+        elif label_map is not None:
+            self.label_map = label_map
+        elif num_classes is not None:
+            self.label_map = create_label_mapping(num_classes, map_unknown_to_n)
+        else:
+            self.label_map = create_label_mapping(3, map_unknown_to_n)
+        self.mode = 'per_segment'
+        self.files = []
+        self.gt = {}
+        print(f"  Indexed {len(self.segment_files)} segment files")
+
     def __len__(self) -> int:
+        if self.mode == 'per_segment':
+            return len(self.segment_files)
         if hasattr(self, 'X'):
             # Using preprocessed file (all in memory)
             return len(self.X)
@@ -683,9 +819,45 @@ class NpzLandmarksDataset(Dataset):
         return len(self.index)
 
     def __getitem__(self, i: int):
+        if self.mode == 'per_segment':
+            segment_file = self.segment_files[i]
+            fs = self._ensure_fs()
+            with load_npz(segment_file, fs=fs if self.is_gcs else None) as npz:
+                X_arr = npz['X']
+                stats_arr = npz['stats']
+                labels_arr = npz['labels']
+                metadata_arr = npz['metadata']
+            if not hasattr(self, '_target_joints'):
+                self._target_joints = X_arr.shape[2]
+            elif X_arr.shape[2] != self._target_joints:
+                X_fixed = np.zeros(
+                    (X_arr.shape[0], X_arr.shape[1], self._target_joints, X_arr.shape[3]),
+                    dtype=X_arr.dtype,
+                )
+                keep = min(self._target_joints, X_arr.shape[2])
+                X_fixed[:, :, :keep, :] = X_arr[:, :, :keep, :]
+                X_arr = X_fixed
+            X = torch.from_numpy(X_arr[0]).float()
+            stats = torch.from_numpy(stats_arr[0]).float()
+            y = torch.tensor(labels_arr[0], dtype=torch.long)
+            meta_struct = metadata_arr[0]
+            meta = {
+                'video': str(meta_struct['video']),
+                'start': int(meta_struct['start']),
+                'label': str(meta_struct['label']),
+            }
+            return X, stats, y, meta
+
         # If using preprocessed file (all in memory), return directly
         if hasattr(self, 'X'):
             X = torch.from_numpy(self.X[i]).float()  # (T, J, C)
+            if not hasattr(self, '_target_joints'):
+                self._target_joints = X.shape[1]
+            elif X.shape[1] != self._target_joints:
+                keep = min(self._target_joints, X.shape[1])
+                X_fixed = torch.zeros((X.shape[0], self._target_joints, X.shape[2]), dtype=X.dtype)
+                X_fixed[:, :keep, :] = X[:, :keep, :]
+                X = X_fixed
             stats = torch.from_numpy(self.stats[i]).float()  # (D,)
             y = torch.tensor(self.labels[i], dtype=torch.long)
             meta = self.metadata[i]
@@ -744,6 +916,13 @@ class NpzLandmarksDataset(Dataset):
             
             # Get the specific segment
             X = torch.from_numpy(X_arr[seg_idx]).float()  # (T, J, C)
+            if not hasattr(self, '_target_joints'):
+                self._target_joints = X.shape[1]
+            elif X.shape[1] != self._target_joints:
+                keep = min(self._target_joints, X.shape[1])
+                X_fixed = torch.zeros((X.shape[0], self._target_joints, X.shape[2]), dtype=X.dtype)
+                X_fixed[:, :keep, :] = X[:, :keep, :]
+                X = X_fixed
             stats = torch.from_numpy(stats_arr[seg_idx]).float()  # (D,)
             y = torch.tensor(labels_arr[seg_idx], dtype=torch.long)
             meta = metadata_arr[seg_idx]
@@ -762,6 +941,19 @@ class NpzLandmarksDataset(Dataset):
             stats: (D,) tensor of pose statistics
             meta: dict with 'video', 'start', 'label'
         """
+        if self.mode == 'per_segment':
+            segment_file = self.segment_files[i]
+            fs = self._ensure_fs()
+            with load_npz(segment_file, fs=fs if self.is_gcs else None) as npz:
+                stats_arr = npz['stats'][0]
+                metadata_arr = npz['metadata'][0]
+            stats = torch.from_numpy(stats_arr).float()
+            return stats, {
+                'video': str(metadata_arr['video']),
+                'start': int(metadata_arr['start']),
+                'label': str(metadata_arr['label']),
+            }
+
         # If using preprocessed file (all in memory), return directly
         if hasattr(self, 'X'):
             stats = torch.from_numpy(self.stats[i]).float()  # (D,)

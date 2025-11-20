@@ -14,7 +14,7 @@ import sys
 import argparse
 from pathlib import Path
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
 # Add parent directory to path
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -51,6 +51,14 @@ def main():
     parser.add_argument('--workers', type=int, default=0, help='DataLoader workers')
     parser.add_argument('--prefetch-factor', type=int, default=2, help='DataLoader prefetch factor')
     parser.add_argument('--print-every', type=int, default=50, help='Print every N batches')
+    parser.add_argument('--limit-train', type=int, default=None,
+                        help='If set, randomly limit the training dataset to this many samples')
+    parser.add_argument('--limit-val', type=int, default=None,
+                        help='If set, randomly limit the validation dataset to this many samples')
+    parser.add_argument('--train-segment-list', type=str, default=None,
+                        help='Optional text file listing train segment NPZ paths to load')
+    parser.add_argument('--val-segment-list', type=str, default=None,
+                        help='Optional text file listing val segment NPZ paths to load')
     
     # Feature arguments
     parser.add_argument('--include-pose', action='store_true', help='Include pose landmarks')
@@ -99,6 +107,7 @@ def main():
         num_classes=args.num_classes,
         preprocessed_dir=data_path,  # Pass GCS path directly - dataset will handle it
         split='train',
+        segment_list_file=args.train_segment_list,
     )
     
     val_ds = NpzLandmarksDataset(
@@ -115,8 +124,19 @@ def main():
         num_classes=args.num_classes,
         preprocessed_dir=data_path,  # Pass GCS path directly - dataset will handle it
         split='val',
+        segment_list_file=args.val_segment_list,
     )
     
+    def maybe_limit(ds, limit, name):
+        if limit is not None and len(ds) > limit:
+            idx = torch.randperm(len(ds))[:limit].tolist()
+            print(f"Limiting {name} dataset from {len(ds)} to {limit} samples")
+            return Subset(ds, idx)
+        return ds
+
+    train_ds = maybe_limit(train_ds, args.limit_train, "train")
+    val_ds = maybe_limit(val_ds, args.limit_val, "val")
+
     print(f"Train dataset: {len(train_ds)} samples")
     print(f"Val dataset: {len(val_ds)} samples")
     

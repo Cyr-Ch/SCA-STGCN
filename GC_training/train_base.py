@@ -519,19 +519,19 @@ def train_model(
         metric_map = {'acc': val_acc, 'loss': val_loss, 'pr_auc': val_pr_auc, 'f1': val_f1}
         current_metric = metric_map.get(best_metric_name, val_acc)
         
-        # Save checkpoint
-        last_ckpt = os.path.join(out_dir, 'last.pt')
+        # Save checkpoint for this epoch (unique filename)
+        epoch_ckpt = os.path.join(out_dir, f"epoch_{epoch:03d}.pt")
         checkpoint_data = {
             'model': model.state_dict(),
             'epoch': epoch,
             'val_acc': val_acc,
             'val_loss': val_loss,
         }
-        torch.save(checkpoint_data, last_ckpt)
+        torch.save(checkpoint_data, epoch_ckpt)
         
         # Save to GCS if specified
         if args.gcs_output:
-            save_checkpoint_to_gcs(last_ckpt, checkpoint_data, args.gcs_output)
+            save_checkpoint_to_gcs(epoch_ckpt, checkpoint_data, args.gcs_output)
         
         # Save best checkpoint
         is_better = False

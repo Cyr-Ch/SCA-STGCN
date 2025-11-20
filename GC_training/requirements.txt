@@ -1,0 +1,10 @@
+# Additional requirements for Google Cloud training
+gcsfs>=2023.1.0
+google-cloud-storage>=2.10.0
+
+# Core dependencies (should match main requirements.txt)
+torch>=1.12.0
+torchvision>=0.13.0
+numpy>=1.21.0
+scikit-learn>=1.0.0
+

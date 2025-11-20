@@ -3,14 +3,9 @@ from typing import Tuple, Dict
 import torch
 import torch.nn as nn
 
-# Support both relative and absolute imports
-try:
-    from .layers import STGCNBackbone
-    from .modules import SignerEncoder, BiasAwareAttention, FiLMSignerAttention, TemporalAggregator, ClassifierHead, SignerHead
-except ImportError:
-    # Fallback to absolute imports
-    from layers import STGCNBackbone
-    from modules import SignerEncoder, BiasAwareAttention, FiLMSignerAttention, TemporalAggregator, ClassifierHead, SignerHead
+# Absolute imports (GC_training scripts already push repo root onto sys.path)
+from layers import STGCNBackbone
+from modules import SignerEncoder, BiasAwareAttention, FiLMSignerAttention, TemporalAggregator, ClassifierHead, SignerHead
 
 
 class SignSTGCNModel(nn.Module):
